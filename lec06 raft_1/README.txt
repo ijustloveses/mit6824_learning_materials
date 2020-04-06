@@ -65,6 +65,7 @@ Raft overview
 - Safety 方面
   + 只要任何一个服务器已经执行了一个 log entry，那么其他服务器必须在同样位置执行相同的 log
   + 保证在所有 non-Byzantine 条件下 (如网络延迟、分区、丢包、重复消息、乱序等) 不会返回错误结果
+  + 以上也是设计 Raft Safety 时的核心目标，只有满足了这个目标，才能达到模拟单服务器的程度
 
 服务器处于3种状态之一
 - follower：完全被动，不会发起请求，只回应 leader & candidate；如果被客户端请求，直接转发给 leader
@@ -257,27 +258,41 @@ Scenario 2.     Server      Slot.12      Slot.13      Slot.14      Slot.15
 - S1 和 S3 进行 leader election，S3 获得全部两票，成为 new leader，term 增加到 5
 - 客户端发起新请求，S3 把命令添加到自己的 log entry Slot.14 上，该命令的 term 为 5，然后 crash。达成！
 
-对于 Scenario 2，我们看到了 3 个服务器的 log entries 都完全不同，此时应该如何处理？
-- Slot.12 很简单，大家都一致，可以保留
-- Slot.13 上，S2 & S3 是一致的，我们可以保留，只要 leader 主动让大家保持同步，也就是让 S1 追加 log 即可
+对于 Scenario 2，我们看看目前各个服务器上 log entry slots 上的状态
+- Slot.12 很简单，大家都一致，不会造成任何问题
+- Slot.13 上 S2 & S3 一致，如果 S2 或 S3 当选新 leader，就只要让 S1 追加即可；否则 S1 当选可能有问题
 - 注意，此时 Slot.13 上的 log 所对应的 command 可能是 commit 的，也可能没有 commit，这是无法推测的
 - 甚至 Slot.12 上的 log 对应的 command 都有可能没有 commit，S3 还未接收到 S1 & S2 的回复就先 crash 了
-- 关键点是：只要某个 slot 中的命令是有可能已经 commit 执行了，就必须保留，否则一定和系统状态不一致
-  在这条原则之下，我们认为 Slot.12 & 13 必须保留下来
-- Slot.14 上的 S2 & S3 的 log 可以删除，这两条必然没有被 commit 执行，完全可以删除掉，让客户端重新请求
+  + 比如 Slot.12 和 13 两个命令由不同客户端发送，而且间隔时间非常非常之短
+  + Slot.12 上的命令由 S3 发给了 S1 & S2，然后还未收到回复，或者收到了回复，但是还未执行或执行完命令
+  + Slot.13 上的命令由 S3 发给了 S2，但在发送 S1 之前 S3 crash 掉了
+- 由于 slot.12 & 13 中的命令是有可能已经 commit 执行了，我们认为这两个 slots 可能是需要保留下来的
+- Slot.14 上的 S2 & S3 的 log 可以删除，因为它们必然没有被 commit 执行
+  也可以保留其中的一条，但不能两条都保留，因为都保留的话，违背了 Safety 原则，造成了 log entries 不一致
+- 到此，我们无法确认一些动作是否已经 commit 执行，也无法确知应该在相互矛盾的动作中选择哪条
+  + 也就是说，leader crash 后，可能某些客户端的请求会被重复执行，有些客户端的请求会被丢掉
+  + 本部分重点是如何保证各服务器间 log entry 的一致性，暂时先不 care 客户端相关的问题
+  
+Scenario 3.     Server      Slot.12      Slot.13      Slot.14      Slot.15
+                S1          term.5       term.6       term.7          
+                S2          term.5       term.8       
+                S3          term.5       term.8
 
-这样，我们可以实现 S1 S2 & S3 三个服务器之间的 log entries 一致性
-
-但是问题是，我们无法确认 log entries 中的动作是否已经 commit 还是没有 commit，这对整个程序来讲还有隐患
+这种场景也可能出现：
+- S1 在 term 6 成为新 leader，然后在收到 Slot.13 中命令时 crash，并未发送给 S2 & S3
+- S1 reboot 然后又在 term 7 成为新 leader，然后在收到 Slot.14 中命令时 crash，并未发送给 S2 & S3
+- S2 或者 S3 当选 new leader，S2 & S3 两个服务器都执行了 Slot.13 中 term 8 的命令，然后 S1 reboot
+- 然后所有服务器 crash，然后又全部 reboot
 
 ##### Raft 保持 log entries 一致的原则和方法
 
-原则
+原则和目标
 - Raft 保证已经 committed 的 log entries 是持久化的，而且最终将会被所有可用 available 的服务器执行
 
 - leader 会记录目前 commit 的最大的 log entry index，且会把该 index 带到后续 AppendEntries 请求中
 - follower 从 AppendEntries 请求中读取该 index，然后执行该 index 对应的 log entry 并执行其中的命令
 
+Raft Log Matching Property
 - Raft log mechanism 中两个重要的属性，称为 Raft Log Matching Property
   + 如果两个服务器的 logs 中，两个 log entries 有相同的 index (位置) 和 term，那么其中的命令一定也相同
     * 这是因为 leader 在其 term 中，在同一个 index 位置上，最多只会创建一个 log entry
@@ -289,7 +304,7 @@ Scenario 2.     Server      Slot.12      Slot.13      Slot.14      Slot.15
 	* 如果是一致的，那么就接受请求，进行 new log entry appending；否则就会拒绝这个 AppendEntries 请求
 	* 根据数据归纳法，该 Property 一定成立，这非常巧妙！
 
-- 由上面的属性，那么如果 leader 从未 crash 的话，各个服务器的 logs 一定最终一致
+- 由上，如果 leader 从未 crash 的话，各个服务器的 logs 一定最终一致，客户端也只能看到 leader 上的状态
 - 反过来，如果服务器间有 logs 的不一致，某 index 上 log entries 有不同的 term，一定发生过 leader crash
   + follower 可能丢掉一些 log entries，因为它没收到老 leader 的 AppendEntries，而新 leader 收到了
   + follower 可能多一些 log entries，因为它收到了老 leader 的 AppendEntries，而新的 leader 没收到
@@ -313,21 +328,152 @@ logs 一致化的方法
   + 我们看到，整个一致化过程中，leader 不会对自己的 log 进行删除或者覆盖，只有 append new entry 操作
     一致化的主导者是 leader，而操作者其实是 follower，其间 leader 并不需要做任何其他特别的操作
 
+- Scenario 2. 的例子
+  + 如果 S3 crash 之后，重新上线，然后又被选为 leader，进入 term 6 的情况
+    * S3 发送 AppendEntries 给 S2，nextIndex[S2] = 15，同时携带前一个 entry 的状态 {index: 14, term: 5}
+    * S2 回复 false，因为它 index 14 上的状态中 term = 4，不满足 Raft Log Matching Property
+	* S3 设置 nextIndex[S2] = 14，并把自己 log 中的 slot.14 & 15 通过 AppendEntries 发给 S2
+    * 同时 AppendEntries 请求中还携带前一个 entry 的状态 {index: 13, term: 3}
+    * S2 检查发现自己的 index 13 也是 term 3，一致，根据 Log Matching Property，说明之前也一定都一致
+	* 于是，S2 删除 index 13 之后的所有 log entries，然后添加 S3 发送过来的 slot.14 & 15 中的内容
+	* 到此， S2 & S3 完全一致！
+	* 于此同时，S3 也会和 S1 做完全类似的操作，S1 在 Slot.12 上和 S3 一致，并追加 Slot.13 & 14 & 15
+	
+  + 如果 S3 crash 之后，重新上线，发现此时 S1 被选为 leader，进入 term 6 的情况
+    * 类似上面的情况，此时 S2 & S3 理应完全复制 S1 服务器的 log，删除自己 Slot.13 & 14 & 15 的 entry
+    * 这里就会有一个问题，前面说过 Slot.13 	是有可能会被执行了的，如果删除，会违背一致性的原则
+	* 前面场景分析以及原则部分都已经说过，有可能被执行的 log entry 必须保留，不能删除
+	* 解决方案：S1 不能当选为 leader！下面会介绍 Raft 保证新当选的 leader 包含所有可能被执行的 entries
 
 
+### Safety 和 leader election 中的限制
+
+前面在实现 log 一致性的时候，方法是让 follower 无条件的复制 new leader 的 log entries
+
+然而遇到一个问题：可能会丢掉已经 committed 的命令，这是不能容忍的。于是需要在 leader 选举时有一些限制
+
+##### 先看一下，是不是选 log entries 最长的服务器就 ok 了？
+
+错！参见 scenario 3 中的情况：
+- 当所有服务器重启后，S1 有最长的 log，但不能选 S1 做 leader，否则会丢掉已经被 committed 的 term 8 命令
+- S2 & S3 都可以做新的 leader，它们的 log entries 中都有 term 8 命令，而且在相同的 index 上
+
+##### Leader Completeness Property 
+
+在 leader election 时就保证：所选举的 leader 包含之前所有 terms 中所 commit 的所有 log entries
+- 在 leader election 的 voting 阶段，一个 candidate 必须获得 majority 的选票才能当选
+- majority 意味着，任何 committed log entries 都至少会在这些投赞同票的服务器中的某一个上
+- 具体如何保证呢？首先定义两个服务器的 log entries 谁更 up-to-date 的算法：(leader election)
+  + 比较两个服务器 logs 的各自最后一个 entry 的 index 和 term
+  + 首先，如果 term 不同，那么 term 更大的更加 up-to-date
+  + 其次，如果 term 相同，那么 index 更大的，也就是说 log 更长的，更加 up-to-date
+- 当收到 candidate 的投票请求时，如果判断自己比 candidate 更 up-to-date，则拒绝投票；否则，投赞同票
+
+由此，我们看一下 scenario 中的场景分析：
+- scenario 2 中
+  + S2 可能被选中，因为 S1 和 S2 会投票
+  + S3 可能被选中，因为 S1 S2 和 S3 都会投票
+  + S1 不会被选中，因为 S2 和 S3 都不会投票，其 term 过低
+- scenario 3 中
+  + S2 和 S3 都可能被选中，因为 S1 S2 和 S3 都会投票
+  + S1 不会被选中，因为 S2 和 S3 都不会投票，其 term 过低
 
 
+### Fast Backup（快速完成 logs 的一致性）
+
+前面说过，在保证 log 一致性的时候，Raft 开始时的做法是每个 AppendEntries 判断一次，如果不一致往回挪一位
+
+但是这个做法在 follower 的 log 和 leader 差距过大时，会非常没有效率
+
+这里提供一个更有效率的算法：让 AppendEntries 的回复包含更多信息，使得 leader 能够更快的找到不一致
+- XTerm：follower 和 leader 冲突的 term
+- XIndex：follower 中 XTerm 第一个 entry 的 index
+- XLen：follower log 的总长度
+
+##### Case 1.
+
+- Follower  4  5  5
+- Leader    4  6  6  6
+
+此时 XTerm 为 5，由于 Leader 都没有 5，于是直接 nextIndex = XIndex，来继续后续的比较
+
+##### Case 2.
+
+- Follower  4  4  4
+- Leader    4  6  6  6
+
+此时 XTerm 为 4，而 Leader 也有 4，那么直接 nextIndex = leader's Term 4 的最后一个 index，继续后续比较
+
+##### Case 3.
+
+- Follower  4
+- Leader    4  6  6  6
+
+当 Follower 的 log 特别短时，让 XTerm = -1，leader 就把 nextIndex 跳到 XLen 所在的位置，进行后续比较
 
 
+### 提交以前 term 的 log entry
+
+问题的场景见论文的 Figure 8.
+1) S1 ~ S5 5 个服务器, S1 获选 term 2 的 leader
+2) S1 在 log index 2 的位置上执行一个命令，并把该命令 replicate 到 S2 上，但是显然未达到 majority
+3) S1 crash，S5 在 term 3 里通过 S3、S4 和自己的选票当选 Leader，然后收到新的命令放到 index 2 处
+4) S5 在开始 replicate 之前就 crash 了，S1 当选 term 4 leader (只有 S5 有权拒绝 S1 而已 term 3 > term 2)
+5) S1 把 term 2 index 2 的 entry replicate 到 majority 机器 S2 S3 上，但是还没有被提交就又 crash 了
+6) S5 term 5 当选，并 replicate 它之前 term 3 index 2 的 entry，成功覆盖了所有服务器的 index 2 位置 
+
+按截止到现在的逻辑来说，即使 step 5 中的命令被 commit 也同样无法避免在 step 6 中被覆盖的情况发生
+
+为什么？因为其 term 为 2，即使 S5 只在 term 3 短暂当选，并且其 entry 并没有 replicate，仍然有权覆盖
+
+如何避免恢复提交以前 term 的 log entry 由于 term 过低而被覆盖的情况呢？
+- Raft 不会通过计算备份的数目，来提交之前 term 的 log entry
+- 只有 leader 的当前 term 的 log entry 才会计算备份数并 commit
+
+由上：
+- 到 step 5 时，即使 term 2 index 2 的 entry 已经复制到 3 个服务器，但是仍然不能 commit
+- 故此，到 step 6 时，即使 S5 覆盖了上面的 log entry，也不会有任何问题，因为该 entry 一定不会被 commit
+- 如果在 step 6 之前，S1 并没有 crash ，而是收到新的命令，并成功复制 majority，那么可以 commit 该命令
+  在执行该命令的时候，就可以提交 term 2 index 2 的命令了。就是说之前 term 的 pending 命令都可以提交
+  提交之后，各个成功复制的 majority 服务器的最后 log entry 的 term 为 4，这样 S1 不会再被选举为 leader
 
 
+### 为什么 Leader Completeness 属性成立？
 
+Leader Completeness 属性保证所有 committed log entries 一定都在被选中的 leader 中，而不会被丢掉
 
+我们采用反证法：
+- 假设 Term T 时的 leader_t 提交的一个 log entry，不在后面 Term U leader_u 的 log 记录中
+- 同时，假设 Term U 是第一个满足上面反证法假设的 Term
 
+在反证法的假设下，我们可以推导出如下的推论
+- 由于 leader 不会删除和覆盖 entries，故此 leader_u 当选时，该 entry 就一定不在 leader_u 的 log 记录中
+- 由于被 leader_t 提交了，故此该 entry 一定已经被 replicate 到 majority 服务器上
+- leader_u 既然当选，故此一定有 majority 服务器投票，那么其中必然有一个服务器 S 的 log 中有该 entry
+- S 一定先 AppendEntries 这个 entry，之后才 vote leader_u，因为 Term T < Term U
+- 由于假设了 Term U 是第一个满足反证法的 Term，那么 T & U 之间的 Terms 的 leaders 都含有该 entry
+- 由上，故此当 S 投票给 leader_u 的时候，S 的 log 记录中仍然有该 entry，因为它不会和这些 leaders 冲突
+- 由于 S 给 leader_u 投票，说明 leader_u 是等于或者 up-to-date 于 S 的
+  + case 1：S 和 leader_u 的 logs 最后一个 entries 的 terms 相同，但是 leader_u 的 log 长度 >= S 的
+  + case 2：S log 最后一个 entry 的 term 小于 leader_u log 最后一个 entry 的 term
 
+由上面的推论，我们可以得到 contradictions：
+- 先看 case 1：
+  + 根据 Log Matching Property，同样 term 同样 index 的命令相同，且前面历史命令也都一定相同
+  + 由于 leader_u 的 log 长度 >= S 的，故此 leader_u 的 log 必然包括或者等于 S 的 log
+  + 这里就矛盾了，因为 entry 在 S 中，但是不在 leader_u 中 
+- 再看 case 2:
+  + 当选之前，leader_u log 的最后一个 entry 的 term (也即 U - 1) 一定大于 T
+  + 那么，(U-1) 这个 term 的 leader 的 log 一定包含该 entry，因为假设了 Term U 是第一个满足反证法的
+  + 由于 (U-1) term 的 leader 创建了 leader_u 当选之前 log 的最后一个 entry，
+    那么根据 Log Matching 属性，此时 leader_u 和 (U-1) term 的 leader 应该有完全相同的命令
+	于是，当选之前 leader_u 应该含有该 entry，这就矛盾了，因为当选之后，leader_u 不会删除其 log entry
+  
+故此，反证法不成立，其假设必然会导致矛盾的结果，进而 Leader Completeness 属性成立
 
-
-
+由此，我们进而得到所谓的 State Machine Safety Property:
+- 如果一个服务器执行了某个 index 上的 log entry，那么在这个 index 上就不会再有其他服务器执行其他命令
+- 很容易由 Leader Completeness 来证明：每个 leader 当选时都会包含所有历史 commits，不会丢失和搞错位置
 
 
 
