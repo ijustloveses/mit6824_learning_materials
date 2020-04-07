@@ -476,9 +476,379 @@ Leader Completeness 属性保证所有 committed log entries 一定都在被选�
 - 很容易由 Leader Completeness 来证明：每个 leader 当选时都会包含所有历史 commits，不会丢失和搞错位置
 
 
+### 各个服务器需要持久化的变量
+
+##### 服务器从 crash 恢复之后如何重新加入 Raft 集群工作？
+
+- two strategies:
+  + 恢复后进入初始化或者 snapshot 状态，leader 通过一致化 replay 所有或者 snapshot 之后的 log entries
+    这个是必须支持的，否则无法处理永久损坏的服务器被替换，或者集群扩容的情况
+  + 恢复后，从持久化的数据中更新状态，直接回到 Raft 集群工作
+    这个也必须支持，否则集群全部 power off 时，系统全部清空或者进入 snapshot，丢掉后面 committed logs
+
+- 于是，我们需要服务器持久化一些必要的状态
+  + log[]：服务器 reboot 之后，将来的 leader 能够保证看到所有 committed log entries
+  + votedFor：防止重启之后忘记了自己曾经 vote A，收到 B 的请求后又投给 B，导致多个 leader 出现
+  + currentTerm：crash 之前的 Term 号必须持久化，否则很多事情都会错，因为用到 Term 的地方太多了
+
+- 有一些状态并不需要持久化，称为 volatile 状态，它们可以在 reboot 后通过持久化的数据和 Raft 来重建
+  + commitIndex：目前已经 committed 的最高 index 的 log entry，可以由 leader AppendEntries 请求恢复
+  + lastApplied：目前已经执行完命令的最高 index 的 log entry，可以由 leader AppendEntries 请求恢复
+  + nextIndex[] (only on leader)：leader crash 后会重新选举 leader，然后重新初始化这个变量
+  + matchIndex[] (only on leader)：保存每个服务器已经 replicated 的最高位置的 log entry，AE 请求重建
+
+##### 持久化的一些讨论
+
+持久化的方式通常是每次改变变量，那么就持久化，只有持久化成功后，才能算完成本次操作
+
+持久化通常是写入 disk，而这就会成为系统性能的瓶颈
+- 机械硬盘写入 10 ms, 这样的话，这个服务每秒最多能服务 100 个请求，性能很差
+- SSD 写入 0.1 ms，这样每秒最多能服务 10000 个请求 (如果其他方面不会成为瓶颈的话)
+  (the other potential bottleneck is RPC, which takes << 1 ms on a LAN)
+- 很多小 tricks 可以克服持久化的性能问题
+  + batch many new log entries per disk write
+  + persist to battery-backed RAM, not disk
+
+
+### log compaction & Snapshots
+
+##### 背景
+
+- 如果只持久化 logs，这样服务器替换或者扩容时，新服务器重建会非常的慢，要 replay 所有 logs
+- logs 可能会非常的巨大，尤其是相对于后台服务的状态来说。那么与其持久化操作(logs)，不如持久化状态
+- 这样，恢复服务时直接加载最近的 snapshot 会快很多
+
+##### snapshot 解决方案
+
+- 各个服务器周期性创建持久化的 snapshot，保存后台服务的状态到 disk 上
+- 同时记住 snapshot 所包含的最后一个 index (lastIncludedIndex)以及该位置对应的 term (lastIncludedTerm)
+- 上面这两个变量会被用于 AppendEntries 请求，因为 AE 请求要前一个 entry 的 index/term 进行一致性检查
+- snapshot 中还会记住 lastIncludedIndex 位置所对应的 config，以支持后续集群的 membership change (后面讲)
+- 然后删除 snapshot 所覆盖的那些 log entries，也即 last index 及其之前的 entries，只保留后面的 entries
+
+##### snapshot 的一些相关事项
+
+在后台服务的某个状态上完成 snapshot 之后，应该要删除 snapshot 点之前的 log，但是
+- un-executed entries 不能丢：log entry 没有执行的话，其结果就没有反应到后台状态，也就不在 snapshot 中
+- un-committed entries 不能丢：因为这个 log entry 可能将会是 majority 的一部分，且一定未被执行
+
+crash+restart 的流程
+- 服务器从 disk 上读取最近的 snapshot
+— 服务器从 disk 上读取持久化的 Logs，也就是 snapshot 之后的那些 Log entries
+- 服务器设置 lastApplied 为 last included index 以避免重新执行已经被执行了的 entries
+
+##### InstallSnapshot 请求
+
+问题来了：
+- 假设某个 follower crash 很久，reboot 之后 log entries 的最后一个 index 为 2
+- 而目前 leader 以及其它服务器都已经 snapshot 完 index 3 之前的状态了
+- 请问：此时该 follower 如何重新回到集群恢复工作状态？
+
+为什么这是个问题？
+- 由于 leader 等服务器都已经完成 snapshot，就是说都已删除了 index 3 之前的 log entries
+- 故此，leader 已经无法 AppendEntries 请求来恢复这个 follower 的 log entries 了，因为 index 3 无法找回
+
+如何解决？
+- 一个方法是 leader 不删除 followers 可能没有 catch up 的那些 log entries，比如上面例子中的 index 3
+- 这个方法有个问题：如果 follower 长期离线，导致 leader 必须长期保留 logs，会引发内存负担过大的问题
+- Raft 采取的方法是：当 AppendEntries 请求失败，无法恢复 log entries 时，会发送 InstallSnapshot 请求
+- 这个请求中， leader 会把自己的 snapshot 发送给 follower，使得 stale follower 恢复到 snapshot 状态
+- 然后，再发送 AppendEntries 请求，就可以通过 logs 一致化的流程，逐步恢复 follower 到最新进度
+
+如果是正常的 follower 而不是 staled follower，收到 InstallSnapshot 请求的话：
+- 可以保存 snapshot，然后在 logs 中删除那些被 snapshot 所 cover 的 entries，保留其他后续 entries
+
+##### snapshot 与 Raft 的模块化
+
+- snapshot 工作密切和 Raft 所支持的后台服务相关，不同服务 snapshot 的方法可能会非常不同
+- 故此，snapshot 使得 Raft 无法完全独立地实现模块化，必须和后台服务进行交互
+- 最后，有一些后台服务的状态也非常大，比如数据库，对其进行 snapshot 也是非常耗时耗空间的操作
+  + 有一些 incremental approaches，比如 Log Cleaning 或者 Log-Structured Merge Tree (LSM Tree)
+  + 或者一些基于 B-Tree 的数据库其本身就已经在 disk 上了，不再需要另外 snapshot
+
+##### Alternative 解决方案？？
+
+- 一个其他方法是只让 leader 进行 snapshot，然后通过 InstallSnapshot 命令把 snapshot 发送给 followers
+- 显然问题一：通过网络发送 snapshot 会极大占用网络带宽，而且减慢 snapshot 的运行时间
+- 显然问题二：leader 的实现会变得更加复杂，snapshot 时间过长，会和其他 RPC 同步运行，如果不中断服务的话
+  
+  
+  
+  
+  
+*** linearizability
+
+we need a definition of "correct" for Lab 3 &c
+  how should clients expect Put and Get to behave?
+  often called a consistency contract
+  helps us reason about how to handle complex situations correctly
+    e.g. concurrency, replicas, failures, RPC retransmission,
+         leader changes, optimizations
+  we'll see many consistency definitions in 6.824
+
+"linearizability" is the most common and intuitive definition
+  formalizes behavior expected of a single server ("strong" consistency)
+
+linearizability definition:
+  an execution history is linearizable if
+    one can find a total order of all operations,
+    that matches real-time (for non-overlapping ops), and
+    in which each read sees the value from the
+    write preceding it in the order.
+
+a history is a record of client operations, each with
+  arguments, return value, time of start, time completed
+
+example history 1:
+  |-Wx1-| |-Wx2-|
+    |---Rx2---|
+      |-Rx1-|
+"Wx1" means "write value 1 to record x"
+"Rx1" means "a read of record x yielded value 1"
+draw the constraint arrows:
+  the order obeys value constraints (W -> R)
+  the order obeys real-time constraints (Wx1 -> Wx2)
+this order satisfies the constraints:
+  Wx1 Rx1 Wx2 Rx2
+  so the history is linearizable
+
+note: the definition is based on external behavior
+  so we can apply it without having to know how service works
+note: histories explicitly incorporates concurrency in the form of
+  overlapping operations (ops don't occur at a point in time), thus good
+  match for how distributed systems operate.
+
+example history 2:
+  |-Wx1-| |-Wx2-|
+    |--Rx2--|
+              |-Rx1-|
+draw the constraint arrows:
+  Wx1 before Wx2 (time)
+  Wx2 before Rx2 (value)
+  Rx2 before Rx1 (time)
+  Rx1 before Wx2 (value)
+there's a cycle -- so it cannot be turned into a linear order. so this
+history is not linearizable. (it would be linearizable w/o Rx2, even
+though Rx1 overlaps with Wx2.)
+
+example history 3:
+|--Wx0--|  |--Wx1--|
+            |--Wx2--|
+        |-Rx2-| |-Rx1-|
+order: Wx0 Wx2 Rx2 Wx1 Rx1
+so the history linearizable.
+so:
+  the service can pick either order for concurrent writes.
+  e.g. Raft placing concurrent ops in the log.
+
+example history 4:
+|--Wx0--|  |--Wx1--|
+            |--Wx2--|
+C1:     |-Rx2-| |-Rx1-|
+C2:     |-Rx1-| |-Rx2-|
+what are the constraints?
+  Wx2 then C1:Rx2 (value)
+  C1:Rx2 then Wx1 (value)
+  Wx1 then C2:Rx1 (value)
+  C2:Rx1 then Wx2 (value)
+  a cycle! so not linearizable.
+so:
+  service can choose either order for concurrent writes
+  but all clients must see the writes in the same order
+  this is important when we have replicas or caches
+    they have to all agree on the order in which operations occur
+
+example history 5:
+|-Wx1-|
+        |-Wx2-|
+                |-Rx1-|
+constraints:
+  Wx2 before Rx1 (time)
+  Rx1 before Wx2 (value)
+  (or: time constraints mean only possible order is Wx1 Wx2 Rx1)
+there's a cycle; not linearizable
+so:
+  reads must return fresh data: stale values aren't linearizable
+  even if the reader doesn't know about the write
+    the time rule requires reads to yield the latest data
+  linearzability forbids many situations:
+    split brain (two active leaders)
+    forgetting committed writes after a reboot
+    reading from lagging replicas
+
+example history 6:
+suppose clients re-send requests if they don't get a reply
+in case it was the response that was lost:
+  leader remembers client requests it has already seen
+  if sees duplicate, replies with saved response from first execution
+but this may yield a saved value from long ago -- a stale value!
+what does linearizabilty say?
+C1: |-Wx3-|          |-Wx4-|
+C2:          |-Rx3-------------|
+order: Wx3 Rx3 Wx4
+so: returning the old saved value 3 is correct
+
+You may find this page useful:
+https://www.anishathalye.com/2017/06/04/testing-distributed-systems-for-linearizability/
+
+*** duplicate RPC detection (Lab 3)
+
+What should a client do if a Put or Get RPC times out?
+  i.e. Call() returns false
+  if server is dead, or request dropped: re-send
+  if server executed, but request lost: re-send is dangerous
+
+problem:
+  these two cases look the same to the client (no reply)
+  if already executed, client still needs the result
+
+idea: duplicate RPC detection
+  let's have the k/v service detect duplicate client requests
+  client picks an ID for each request, sends in RPC
+    same ID in re-sends of same RPC
+  k/v service maintains table indexed by ID
+  makes an entry for each RPC
+    record value after executing
+  if 2nd RPC arrives with the same ID, it's a duplicate
+    generate reply from the value in the table
+
+design puzzles:
+  when (if ever) can we delete table entries?
+  if new leader takes over, how does it get the duplicate table?
+  if server crashes, how does it restore its table?
+
+idea to keep the duplicate table small
+  one table entry per client, rather than one per RPC
+  each client has only one RPC outstanding at a time
+  each client numbers RPCs sequentially
+  when server receives client RPC #10,
+    it can forget about client's lower entries
+    since this means client won't ever re-send older RPCs
+
+some details:
+  each client needs a unique client ID -- perhaps a 64-bit random number
+  client sends client ID and seq # in every RPC
+    repeats seq # if it re-sends
+  duplicate table in k/v service indexed by client ID
+    contains just seq #, and value if already executed
+  RPC handler first checks table, only Start()s if seq # > table entry
+  each log entry must include client ID, seq #
+  when operation appears on applyCh
+    update the seq # and value in the client's table entry
+    wake up the waiting RPC handler (if any)
+
+what if a duplicate request arrives before the original executes?
+  could just call Start() (again)
+  it will probably appear twice in the log (same client ID, same seq #)
+  when cmd appears on applyCh, don't execute if table says already seen
+
+how does a new leader get the duplicate table?
+  all replicas should update their duplicate tables as they execute
+  so the information is already there if they become leader
+
+if server crashes how does it restore its table?
+  if no snapshots, replay of log will populate the table
+  if snapshots, snapshot must contain a copy of the table
+
+but wait!
+  the k/v server is now returning old values from the duplicate table
+  what if the reply value in the table is stale?
+  is that OK?
+
+example:
+  C1           C2
+  --           --
+  put(x,10)
+               first send of get(x), 10 reply dropped
+  put(x,20)
+               re-sends get(x), gets 10 from table, not 20
+
+what does linearizabilty say?
+C1: |-Wx10-|          |-Wx20-|
+C2:          |-Rx10-------------|
+order: Wx10 Rx10 Wx20
+so: returning the remembered value 10 is correct
+
+*** read-only operations (end of Section 8)
+
+Q: does the Raft leader have to commit read-only operations in
+   the log before replying? e.g. Get(key)?
+
+that is, could the leader respond immediately to a Get() using
+  the current content of its key/value table?
+
+A: no, not with the scheme in Figure 2 or in the labs.
+   suppose S1 thinks it is the leader, and receives a Get(k).
+   it might have recently lost an election, but not realize,
+   due to lost network packets.
+   the new leader, say S2, might have processed Put()s for the key,
+   so that the value in S1's key/value table is stale.
+   serving stale data is not linearizable; it's split-brain.
+   
+so: Figure 2 requires Get()s to be committed into the log.
+    if the leader is able to commit a Get(), then (at that point
+    in the log) it is still the leader. in the case of S1
+    above, which unknowingly lost leadership, it won't be
+    able to get the majority of positive AppendEntries replies
+    required to commit the Get(), so it won't reply to the client.
+
+but: many applications are read-heavy. committing Get()s
+  takes time. is there any way to avoid commit
+  for read-only operations? this is a huge consideration in
+  practical systems.
+
+idea: leases
+  modify the Raft protocol as follows
+  define a lease period, e.g. 5 seconds
+  after each time the leader gets an AppendEntries majority,
+    it is entitled to respond to read-only requests for
+    a lease period without commiting read-only requests
+    to the log, i.e. without sending AppendEntries.
+  a new leader cannot execute Put()s until previous lease period
+    has expired
+  so followers keep track of the last time they responded
+    to an AppendEntries, and tell the new leader (in the
+    RequestVote reply).
+  result: faster read-only operations, still linearizable.
+
+note: for the Labs, you should commit Get()s into the log;
+      don't implement leases.
+
+in practice, people are often (but not always) willing to live with stale
+  data in return for higher performance
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Raft 的一些小结
+
+##### committed v.s. applied
+
+- committed 表示 leader 的 entry 已经被 majority 服务器 replicated 的状态，不会丢失了
+- applied 表示 entry (上的命令) 被执行 executed，致使后台服务比如 K/V 的 state 已经发生了变化
+
+##### 重要属性
+
+- Election Safety：每个 term 最多只有一个服务器会被选为 leader
+- Leader Append-Only：leader 不会覆盖或者删除其 log 中的 entries，只会 append 新的 entries
+- Log Matching：两个 logs 包含 index & term 都相同的 entry，那么该 entry 之前的所有 entries 命令都一致
+- Leader Completeness：一旦某 log entry 被 commit，那么它必然会出现在后面所有 terms 的 leader logs 中
+- State Machine Safety：在某 index 上的 entry 一旦被应用，则该 index 不会再有别的服务器应用其他 entry
 
 
 
