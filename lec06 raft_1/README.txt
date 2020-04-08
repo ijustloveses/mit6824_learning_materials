@@ -573,269 +573,222 @@ crash+restart 的流程
 - 显然问题二：leader 的实现会变得更加复杂，snapshot 时间过长，会和其他 RPC 同步运行，如果不中断服务的话
   
   
-  
-  
-  
-*** linearizability
+### linearizability 的保证
 
-we need a definition of "correct" for Lab 3 &c
-  how should clients expect Put and Get to behave?
-  often called a consistency contract
-  helps us reason about how to handle complex situations correctly
-    e.g. concurrency, replicas, failures, RPC retransmission,
-         leader changes, optimizations
-  we'll see many consistency definitions in 6.824
+前面我们介绍了 Raft 如何保证 leader 的唯一性、committed logs 不会丢失性和 logs 一致性
 
-"linearizability" is the most common and intuitive definition
-  formalizes behavior expected of a single server ("strong" consistency)
+现在要讨论的是，对于客户端来讲，调用 Raft 后台服务的正确性。何为 correctness？需要一个定义
 
-linearizability definition:
-  an execution history is linearizable if
-    one can find a total order of all operations,
-    that matches real-time (for non-overlapping ops), and
-    in which each read sees the value from the
-    write preceding it in the order.
+"linearizability"：对 Raft 集群的调用行为就和调用一个 single server 一样，更具体的定义如下：
+- 多个客户端对 Raft 集群并发调用，最终得到若干个请求和回复
+- 能够找到一个全部 operations 的整体执行序列，使所有读请求的结果都是序列中该读请求之前的写请求的写入值
 
-a history is a record of client operations, each with
-  arguments, return value, time of start, time completed
+下面我们会讨论一些例子，看它们是否能保证 linearizability 的要求。之前我们统一一下写作规范
+- |-Wx1-|：第一个竖线表示发送请求的时间点，第二个竖线表示收到请求的时间点，Wx1 表示写请求，写入 x=1
+- |-Rx1-|：竖线含义同上，Rx1 表示读请求，读取 x 值，结果为 1
+- 注意，两个竖线只是发送请求和收到结果的点，而命令真正执行的时间点可能在两个竖线之间的任意位置上
+- |-×-Wx1-|：表示在 × 点上命令真正的执行，比如说 1 在此时真正写入了 x 变量中
 
-example history 1:
+##### example history 1 （可行）
+
   |-Wx1-| |-Wx2-|
     |---Rx2---|
       |-Rx1-|
-"Wx1" means "write value 1 to record x"
-"Rx1" means "a read of record x yielded value 1"
-draw the constraint arrows:
-  the order obeys value constraints (W -> R)
-  the order obeys real-time constraints (Wx1 -> Wx2)
-this order satisfies the constraints:
-  Wx1 Rx1 Wx2 Rx2
-  so the history is linearizable
+	  
+由上我们能看到：
+- 1 一定在 2 之前被写入
+- Rx1 和 Rx2 请求发生在 Wx1 请求的执行时间内，Rx1 和 Rx2 请求的回复发生在 Wx2 请求的执行时间内
+- Rx1 请求的发生和回复都发生在 Rx2 请求的执行时间内
 
-note: the definition is based on external behavior
-  so we can apply it without having to know how service works
-note: histories explicitly incorporates concurrency in the form of
-  overlapping operations (ops don't occur at a point in time), thus good
-  match for how distributed systems operate.
+我们可以实现一个执行序列： Wx1 Rx1 Wx2 Rx2，就能够满足上图 4 个请求的执行情况
 
-example history 2:
+  |-Wx1-×--| |-×-Wx2--|
+     |----Rx2----×-|
+       |--×-Rx1-|
+
+##### example history 2 （不可行）
+
   |-Wx1-| |-Wx2-|
     |--Rx2--|
               |-Rx1-|
-draw the constraint arrows:
-  Wx1 before Wx2 (time)
-  Wx2 before Rx2 (value)
-  Rx2 before Rx1 (time)
-  Rx1 before Wx2 (value)
-there's a cycle -- so it cannot be turned into a linear order. so this
-history is not linearizable. (it would be linearizable w/o Rx2, even
-though Rx1 overlaps with Wx2.)
+			  
+由上图，我们可以看到：
+- 从时间轴上看，Wx1 先于 Wx2 执行完成
+- 从时间轴上看，Rx2 先于 Rx1 执行完成
+这显然发生了冲突，因为 Rx2 必然在 Wx2 之后才能完成，此时 x=1 的值已经被 x=2 覆盖，不可能之后读到 Rx1
 
-example history 3:
+##### example history 3 （可行）
+
 |--Wx0--|  |--Wx1--|
             |--Wx2--|
         |-Rx2-| |-Rx1-|
-order: Wx0 Wx2 Rx2 Wx1 Rx1
-so the history linearizable.
-so:
-  the service can pick either order for concurrent writes.
-  e.g. Raft placing concurrent ops in the log.
+		
+由上图，我们可以看到
+- Rx2 一定比 Rx1 执行完毕，那么意味着如果可行，那么必然 Wx2 应该比 Wx1 更早执行完毕
+- 有图上可以看到，Wx2 请求的回复时间更晚，但这和前面所说的更早执行完毕并不冲突，只是其他方面拖慢了请求
 
-example history 4:
+我们能找到一个可行的执行顺序: Wx0 Wx2 Rx2 Wx1 Rx1
+
+|--Wx0--|  |---Wx1--×--|
+            |-×--Wx2-----|
+        |-Rx2---×-| |-×-Rx1-|
+
+##### example history 4 （不可行）
+
 |--Wx0--|  |--Wx1--|
             |--Wx2--|
 C1:     |-Rx2-| |-Rx1-|
 C2:     |-Rx1-| |-Rx2-|
-what are the constraints?
-  Wx2 then C1:Rx2 (value)
-  C1:Rx2 then Wx1 (value)
-  Wx1 then C2:Rx1 (value)
-  C2:Rx1 then Wx2 (value)
-  a cycle! so not linearizable.
-so:
-  service can choose either order for concurrent writes
-  but all clients must see the writes in the same order
-  this is important when we have replicas or caches
-    they have to all agree on the order in which operations occur
 
-example history 5:
+由上图，我们可以看到两个客户端 C1 & C2 各发起了两次读请求，并得到完全相反的结果
+- 由 C1 的请求，Wx2 必然要比 Wx1 先执行完毕，才能得到 Rx2 比 Rx1 更早执行完毕的结果
+- 由 C2 的请求，Wx1 必然要比 Wx2 先执行完毕，才能得到 Rx1 比 Rx2 更早执行完毕的结果
+
+矛盾，所以不可行
+- 单看 C1 或者 C2，都能得到可行的执行序列，但是 linearizability 不允许不同的客户端看到不同的顺序结果
+- 有 replicas 服务器的系统，出现不同客户端不同结果的问题是可能的，但是 linearizability 要求次序必须一致
+
+##### example history 5 （不可行）
+
 |-Wx1-|
         |-Wx2-|
                 |-Rx1-|
-constraints:
-  Wx2 before Rx1 (time)
-  Rx1 before Wx2 (value)
-  (or: time constraints mean only possible order is Wx1 Wx2 Rx1)
-there's a cycle; not linearizable
-so:
-  reads must return fresh data: stale values aren't linearizable
-  even if the reader doesn't know about the write
-    the time rule requires reads to yield the latest data
-  linearzability forbids many situations:
-    split brain (two active leaders)
-    forgetting committed writes after a reboot
-    reading from lagging replicas
 
-example history 6:
-suppose clients re-send requests if they don't get a reply
-in case it was the response that was lost:
-  leader remembers client requests it has already seen
-  if sees duplicate, replies with saved response from first execution
-but this may yield a saved value from long ago -- a stale value!
-what does linearizabilty say?
+这个显然也是不可行的，但是之所以提出来，是要告诉我们，linearizability 不允许：
+- 读请求返回 staled 结果，比如 from lagging replicas
+- split brain (two active leaders，或者从进度不同的 replicated 服务器读取数据)
+- forgetting committed writes after a reboot
+
+##### example history 6 （允许 re-send 的情况下读取 staled 数据）
+
+- 假设 C2 在 Wx3 完成后，Wx4 请求之前发送了 Rx 读请求，但是没有收到回复，于是又发送了一次
+- 结果，在 C1 的 Wx4 执行完成之后才返回，且返回值为 3，而不是 4
+
 C1: |-Wx3-|          |-Wx4-|
 C2:          |-Rx3-------------|
-order: Wx3 Rx3 Wx4
-so: returning the old saved value 3 is correct
 
-You may find this page useful:
-https://www.anishathalye.com/2017/06/04/testing-distributed-systems-for-linearizability/
+这个是 linearizability 所允许的
+- 很可能服务器已经对第一个 Rx 请求返回了结果 3，并进行了缓存
+- 当 C2 re-send Rx 请求时，服务器中 x 已经被覆盖为 4 了，但服务器看到这是个 re-send，故此返回缓存值 3
 
-*** duplicate RPC detection (Lab 3)
+linearizability 认为执行序列其实是：Wx3 Rx3 Wx4，仍然认为 Rx3 发生在 Wx4 之前，不违反次序
 
-What should a client do if a Put or Get RPC times out?
-  i.e. Call() returns false
-  if server is dead, or request dropped: re-send
-  if server executed, but request lost: re-send is dangerous
+更多 linearizability 的话题参见：
+- https://www.anishathalye.com/2017/06/04/testing-distributed-systems-for-linearizability/
 
-problem:
-  these two cases look the same to the client (no reply)
-  if already executed, client still needs the result
 
-idea: duplicate RPC detection
-  let's have the k/v service detect duplicate client requests
-  client picks an ID for each request, sends in RPC
-    same ID in re-sends of same RPC
-  k/v service maintains table indexed by ID
-  makes an entry for each RPC
-    record value after executing
-  if 2nd RPC arrives with the same ID, it's a duplicate
-    generate reply from the value in the table
+### 其他的一些相关问题
 
-design puzzles:
-  when (if ever) can we delete table entries?
-  if new leader takes over, how does it get the duplicate table?
-  if server crashes, how does it restore its table?
+##### duplicate RPC detection 重发请求的检测
 
-idea to keep the duplicate table small
-  one table entry per client, rather than one per RPC
-  each client has only one RPC outstanding at a time
-  each client numbers RPCs sequentially
-  when server receives client RPC #10,
-    it can forget about client's lower entries
-    since this means client won't ever re-send older RPCs
+由上面的 example history 6，我们知道 Raft 支持对重发的请求通过缓存直接返回结果
 
-some details:
-  each client needs a unique client ID -- perhaps a 64-bit random number
-  client sends client ID and seq # in every RPC
-    repeats seq # if it re-sends
-  duplicate table in k/v service indexed by client ID
-    contains just seq #, and value if already executed
-  RPC handler first checks table, only Start()s if seq # > table entry
-  each log entry must include client ID, seq #
-  when operation appears on applyCh
-    update the seq # and value in the client's table entry
-    wake up the waiting RPC handler (if any)
+为什么要支持？
+- 客户端可能未收到服务器返回的结果，可能是服务器挂掉了，可能是服务器返回了，但是网络出了问题
+- 两种情况对于客户端来看，结果都是一样的，无法分辨是哪种情况，故此它只能 re-send 重发请求
+- 但是，对于服务器来说，如果不分辨是否是重发的请求，就必须支持相同的命令重复执行的幂等性，否则会出问题
+- 然而，上面的要求是个非常强的要求，很难满足，还不如支持对于重发请求的检测来得更容易一些
 
-what if a duplicate request arrives before the original executes?
-  could just call Start() (again)
-  it will probably appear twice in the log (same client ID, same seq #)
-  when cmd appears on applyCh, don't execute if table says already seen
+实现方法 duplicate RPC detection
+- 客户端要对每个请求分配一个唯一 ID，重发的请求共享之前的 ID
+- 服务器端对每个客户端都维护一个 table，保存对每个请求的返回结果
+- 如果某个客户端发送的请求 ID 已经在其 table 中，直接返回 table 中的结果
+- 一旦客户端发送了一个请求 ID，那么该 ID 之前的那些请求在 table 中的记录都可以删除了，说明客户端已收到
+  （其实这里暗含一些要求：每个客户端在同一时间里只有一个 outstanding RPC 请求，且客户端请求 ID 递增）
+- 如果重发的请求过来时，第一个请求还未结束怎么办？就不取缓存直接运行呗，第二次的结果会覆盖第一次结果
+- new leader 如何获取缓存 table 呢？我们让每个 replica 服务器都更新自己的 tables，new leader 自然就有了
+- 服务器 crash 了，如何重建 table？
+  + 如果没有 snapshot，则 replay log 并使用 replay 的结果来重新生成这个 table
+  + 如果有 snapshot，让 snapshot 中也包含一份 table 的 copy 即可 
 
-how does a new leader get the duplicate table?
-  all replicas should update their duplicate tables as they execute
-  so the information is already there if they become leader
+##### More about 只读操作
 
-if server crashes how does it restore its table?
-  if no snapshots, replay of log will populate the table
-  if snapshots, snapshot must contain a copy of the table
+这里的问题是: 对于只读的操作来说，先要经过 majority commit 才能执行的要求是有必要么？
 
-but wait!
-  the k/v server is now returning old values from the duplicate table
-  what if the reply value in the table is stale?
-  is that OK?
-
-example:
-  C1           C2
-  --           --
-  put(x,10)
-               first send of get(x), 10 reply dropped
-  put(x,20)
-               re-sends get(x), gets 10 from table, not 20
-
-what does linearizabilty say?
-C1: |-Wx10-|          |-Wx20-|
-C2:          |-Rx10-------------|
-order: Wx10 Rx10 Wx20
-so: returning the remembered value 10 is correct
-
-*** read-only operations (end of Section 8)
-
-Q: does the Raft leader have to commit read-only operations in
-   the log before replying? e.g. Get(key)?
-
-that is, could the leader respond immediately to a Get() using
-  the current content of its key/value table?
-
-A: no, not with the scheme in Figure 2 or in the labs.
-   suppose S1 thinks it is the leader, and receives a Get(k).
-   it might have recently lost an election, but not realize,
-   due to lost network packets.
-   the new leader, say S2, might have processed Put()s for the key,
-   so that the value in S1's key/value table is stale.
-   serving stale data is not linearizable; it's split-brain.
+是有必要的！
+- 有时 old leader 在 minority 分区中或者联系不上其他服务器，有一个时间窗口内，它仍不知道
+- 如果不需要 commit，那么这个 old leader 就可能会响应客户端的请求，并返回结果，而这个结果可能是 staled
+- 同时，new leader 可能更新了数据，同样也会响应其他客户端的请求，于是形成了 split brain
    
-so: Figure 2 requires Get()s to be committed into the log.
-    if the leader is able to commit a Get(), then (at that point
-    in the log) it is still the leader. in the case of S1
-    above, which unknowingly lost leadership, it won't be
-    able to get the majority of positive AppendEntries replies
-    required to commit the Get(), so it won't reply to the client.
+只有先经过 majority commit，old leader 才能发现它无法对请求获得多数票，也就无法响应客户端的请求
 
-but: many applications are read-heavy. committing Get()s
-  takes time. is there any way to avoid commit
-  for read-only operations? this is a huge consideration in
-  practical systems.
+对于一些应用，可能会有非常 heavy 的 read 只读请求，而如果获取 majority commit 的话，会比较花费时间
+- 方法一：一些实践中的应用，其调用者并不是很 care 是否得到相对 staled 的数据，而是更追求性能
+- 方法二：lease
+  + 需要修改 Raft 协议，增加 lease 的概念，比如定义每个 lease 为 5 秒的时间
+  + 每次 leader 的只读操作在 AppendEntries RPC 中获得了 majority，进入了 commit 状态，就发一个 lease
+  + 在 Lease 的时间段里，后续的只读操作不再需要 majority commit 的要求
+  + 为了避免 staled 数据，在 lease 时间段内，同样不允许写入操作，保证只读操作的结果都正确
 
-idea: leases
-  modify the Raft protocol as follows
-  define a lease period, e.g. 5 seconds
-  after each time the leader gets an AppendEntries majority,
-    it is entitled to respond to read-only requests for
-    a lease period without commiting read-only requests
-    to the log, i.e. without sending AppendEntries.
-  a new leader cannot execute Put()s until previous lease period
-    has expired
-  so followers keep track of the last time they responded
-    to an AppendEntries, and tell the new leader (in the
-    RequestVote reply).
-  result: faster read-only operations, still linearizable.
+##### Follower 或者 Candidates crash 会如何？
 
-note: for the Labs, you should commit Get()s into the log;
-      don't implement leases.
+前面介绍了 leader crash 后要进行的 leader election 等问题，那么非 leader crash 会有什么影响呢？
 
-in practice, people are often (but not always) willing to live with stale
-  data in return for higher performance
+此时，发送给他的 AppendEntries 和 RequestVote 请求会失败，那么也没什么，再重发给他就是了，一直重发！
 
+那么，如果他是在完成了请求但是发送回复消息之前 crash 的怎么办？reboot 后不就会再次执行一遍请求了么？
+- 是的，但是没关系，我们要求 AppendEntries 和 RequestVote 请求的执行是幂等性的，因为并不会影响服务状态
+  + 对于 AppendEntries 请求，它要判断是不是对应的命令已经加入到自己的 logs 中了，如果是的话直接返回即可
+  + 对于 RequestVote 请求，类似判断是否已经在对应 term 中选举了相同的调用服务器
+    * 如果选举了，说明 crash 之前就已经执行选举了，但是调用服务器未收到回复，那么直接回复 yes 即可
+	* 如果选举了其他服务器，那么一个 term 只能选举一次，那么返回 no 即可
+  + 非 leader 不会处理客户端的命令，即使接收到客户端的请求，也只会转发给 leader，故此不会有什么影响
 
+##### RPC 执行时间和 leader election timout 的选择
 
+RPC 的执行时间称为 broadcast time，指一个服务器并发给其他每个服务器发送 RPC 请求并最终得到所有回复的时间
 
+leader election timeout 前面说过，是指一个服务器等待多久没有收到 leader 的消息就会重新发起选举的时间
+
+我们希望 broadcast time << leader election timeout，通常要少一个数量级，比如小 20 倍为佳
+- broadcast time 是服务器之间的网络以及 Raft 请求实现算法决定的，通常为 0.5 ~ 20 ms
+- leader election timeout 是完全由实现者所选择的，按上面的要求，通常为 10 ~ 500 ms
 
 
+### Raft 集群成员变化 (服务器替换、扩容、减容等)
 
+当集群服务器成员发生变化时，最保险的方法是停止集群，然后调整 configuration，最后重启集群
 
+问题在于，上面的方法会短暂的停止服务，影响集群的可用性。有办法不停止服务就能自动调整服务器成员么？
+- 难点在于，任何方法也不可能在一瞬间更新所有服务器上的 configuration
+- 于是很可能会有一个时间窗口上，有的服务器还是使用 old configuration，有的已经用了新的
+- 这样，如果这个窗口发生了 leader election，可能会在两个 configurations 上各自产生一个 leader
+- 比如 3 个增加到 5 个，原来两个还是老的配置，会产生一个 leader，剩下三个又产生一个新配置下的 leader
 
+Raft 采用 two-phase 方法，在新旧配置交接的时间段内引入 transitional configuration (称 joint consensus)
+- Raft 会把 configuration 作为一种 log entry
+  + 类似普通 log entry，当 majority 收到 AppendEntries 请求中的配置，该配置就达到 commit 状态
+  + 不同的是，只要 follower 收到配置数据，就会立即使用新配置来做后续决策，不管是否达到 commit 状态
+- joint consensus 会合并 old and new configuraitons
+  + Log entries 会被 replicated 到新配置和旧配置中的所有的服务器上去
+  + 新、旧配置中的任何一个服务器都可能被选为 leader
+  + 期间 RequestVote 和 AppendEntries 请求的 commit 需要新、旧配置中的服务器都各自达到 majority 才行
+- 好处就是通过这个方法，在配置调整的过程中都不会中断客户端的请求，而且不会影响之前说过的 Safety
 
+Raft 的论文并没有对集群成员变化的流程和细节做很详细的介绍，有很多语焉不详的地方，需要仔细看论文和代码
 
-
-
-
-
-
-
+https://github.com/logcabin/logcabin
 
 
 ### Raft 的一些小结
+
+到此，我们已经学习完整个 Raft 的设计，包括：
+- 客户端发送请求后，Raft 集群处理请求的整个流程
+- Leader election 的算法，保证每个 term 最多只有一个 leader 产生
+- Raft 如何保证 logs 即使经历 failures 仍能保持一致化
+- Log Matching Property
+- Leader election 时的限制，使得 leader 一定会包含所有的 commits （Leader Completeness)
+- 各个服务器要持久化的数据，以免 reboot 后丢失
+- Log compaction 和 Snapshot
+- Raft 如何保证 Linearizability 属性
+- 一些其他方面的讨论
+  + Fast Backup 的实现 
+  + 如何提交之前 term 的 log entries
+  + duplicate RPC detection 重发请求的检测
+  + More about 只读操作
+  + Follower 或者 Candidates crash 会如何？
+  + RPC 执行时间和 leader election timout 的选择
+  + Raft 集群成员变化
 
 ##### committed v.s. applied
 
@@ -849,7 +802,6 @@ in practice, people are often (but not always) willing to live with stale
 - Log Matching：两个 logs 包含 index & term 都相同的 entry，那么该 entry 之前的所有 entries 命令都一致
 - Leader Completeness：一旦某 log entry 被 commit，那么它必然会出现在后面所有 terms 的 leader logs 中
 - State Machine Safety：在某 index 上的 entry 一旦被应用，则该 index 不会再有别的服务器应用其他 entry
-
 
 
 
