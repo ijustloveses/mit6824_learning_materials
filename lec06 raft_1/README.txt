@@ -32,6 +32,8 @@ split brain 问题
 - 一个核心关键点，在于即使 majority partition 成员发生变化，那么至少有一个成员是重复的
   这样该成员就能把之前的 majority 的决策带给变化之后的 partition 的所有成员，保证了状态延续
 
+目的是设计一套分布式系统的协议或者说算法，使得其不可靠的节点能够对事件的执行顺序达成一致
+
 在 Raft 之前，有两个 partition-tolerant replication schemes 在 1990 年左右被发明出来
 - Paxos and View-Stamped Replication (VSR)，尤其是 Paxos 被广泛使用
 - Paxos 的概念过于复杂，不利于理解和实现
@@ -55,6 +57,23 @@ Raft overview
 ================
 
 ### 简单介绍
+
+##### 前提假设
+
+- 分布式系统是异步的，消息可能无限的延迟，而且不保证各个服务器之间的时间完全同步和一致
+- 网络不可靠，可能延迟、丢包、网络分区、重复消息和顺序错乱
+- 不会发生 Byzantine failure，主要是两个方面：
+  + 一旦失败就停止服务，称为 fail-stop，而不会因为失败而返回奇怪或者错误的结果
+  + 没有叛徒、木马等有益破坏的节点和外部入侵
+- 客户端一定只通过 leader 和系统交互，如果客户端联系到非 leader，那么会返回其认为的 latest leader
+- 每个服务器的后台服务所对应的 "state machine" 初始状态都完全一致，而且执行命令后的结果是确定的
+  + 这样，按同样顺序 replay 命令序列就能保证每个服务器上的 state machine 达到同样的状态
+- 假设各服务器能访问无限的持久化存储，且存储都是可用的，不会 corrupted，且日志都是 write-ahead 方式记录
+- 服务器节点的配置信息是静态初始化的，每个节点都知道其他节点的存在，且服务期间集群成员不会发生变化
+  + 实际上后来 Raft 的设计者/论文作者放松了这个限制，能够支持集群成员的配置动态变化
+- 客户端在任一时刻最多只有一个 outstanding 命令，且每个命令都按序号进行，一个命令完成了，才进行下一个
+
+##### 特点和特性
 
 - Raft 会首先选举一个 leader，然后由 leader 全权控制 replicated logs
 - 具体的 leader 会从 client 接受 log entries，复制到各服务器上，并适时告知后者执行这些 log entries
@@ -109,13 +128,12 @@ Client:          -------------------       -------------------       -----------
    其实，所谓 committed 就是表示这个 command 的 log entry 已经不会因为 failure 而丢失了
    进而，这个不会丢失是指一旦能够有 majority 个服务器组成分区，那么就一定能恢复状态
    那么，如果无法恢复 majority 以上的服务器的分区，其实还是会丢失，比如所有服务器都 crash 了
-5. leader 执行 command, 然后回复给客户端
+5. leader 执行 command, 更新它的 commitIndex 变量，然后回复给客户端
 
-之后，leader "piggybacks" commit info in next AppendEntries，followers 执行 entry 中的命令
-
-对于未回复 AppendEntries 的 followers (crash、slow、丢包等)，leader 还会负责重发，直到 log entry 被存储
-
-很显然，followers 的状态和 leader 的状态会在一定时间窗口内不完全一致，但是最终会达成一致
+- 之后，leader "piggybacks" commitIndex in next AppendEntries，followers 同样执行命令，更新 commitIndex 
+- 每个服务器维护自己的 commitIndex，根据 leader 的 commitIndex 更新，会执行更新前后 Index 之间的命令
+- 对于未回复 AppendEntries 的 followers (crash、丢包等)，leader 还会负责重发，直到 log entry 被存储
+- 很显然，followers 的状态和 leader 的状态会在一定时间窗口内不完全一致，但是最终会达成一致
 
 
 ### 一些要点分析和设计
@@ -419,16 +437,22 @@ logs 一致化的方法
 2) S1 在 log index 2 的位置上执行一个命令，并把该命令 replicate 到 S2 上，但是显然未达到 majority
 3) S1 crash，S5 在 term 3 里通过 S3、S4 和自己的选票当选 Leader，然后收到新的命令放到 index 2 处
 4) S5 在开始 replicate 之前就 crash 了，S1 当选 term 4 leader (只有 S5 有权拒绝 S1 而已 term 3 > term 2)
-5) S1 把 term 2 index 2 的 entry replicate 到 majority 机器 S2 S3 上，但是还没有被提交就又 crash 了
+5) S1 把 term 2 index 2 的 entry replicate 到 majority 机器 S2 S3 达成 commit，然后就又 crash 了 
 6) S5 term 5 当选，并 replicate 它之前 term 3 index 2 的 entry，成功覆盖了所有服务器的 index 2 位置 
 
-按截止到现在的逻辑来说，即使 step 5 中的命令被 commit 也同样无法避免在 step 6 中被覆盖的情况发生
-
-为什么？因为其 term 为 2，即使 S5 只在 term 3 短暂当选，并且其 entry 并没有 replicate，仍然有权覆盖
+为什么？因为其 term 为 2，即使 S5 只在 term 3 短暂当选，并且其 entry 并没有 replicate，仍然能覆盖之
 
 如何避免恢复提交以前 term 的 log entry 由于 term 过低而被覆盖的情况呢？
-- Raft 不会通过计算备份的数目，来提交之前 term 的 log entry
+- Raft 不会通过计算备份的数目，来 commit 以前 term 的 log entry
+- 故此 step 5 中虽然 majority 了，但是不代表 term 2 index 2 的 entry 达到 commit 状态，就是说可以覆盖
+- 所谓不能 commit 是说即使 leader 发现已经 majority 了，也不执行命令，也不更新 commitIndex
 - 只有 leader 的当前 term 的 log entry 才会计算备份数并 commit
+- 于是，如果 S1 希望 commit term 2 index 2 的 entry，必须像 Figure 8. 中那样，在后面 entry 追加一个命令
+- S1 追加命令的 term 为 4，只要该请求被 majority commit，那么 term 2 的命令自然会隐式被提交(一致化)
+- 即使 S1 crash，S5 重新 term 5 当选，S5 也不可能覆盖 term 2 index 2 了，因为
+  + S5 之所以能当选，必然已经 replicate 了 term 2 index 2 和 term 4 index 3的命令，且删除了 term 3 命令
+  + 否则，其 logs 最后一个命令的 term 为 3，term 3 < term 4，是不可能当选的
+- leader 及 majority 服务器都执行原 commitIndex 到 term 4 index 3 之间的所有命令，并更新 commitIndex=3
 
 由上：
 - 到 step 5 时，即使 term 2 index 2 的 entry 已经复制到 3 个服务器，但是仍然不能 commit
@@ -436,6 +460,12 @@ logs 一致化的方法
 - 如果在 step 6 之前，S1 并没有 crash ，而是收到新的命令，并成功复制 majority，那么可以 commit 该命令
   在执行该命令的时候，就可以提交 term 2 index 2 的命令了。就是说之前 term 的 pending 命令都可以提交
   提交之后，各个成功复制的 majority 服务器的最后 log entry 的 term 为 4，这样 S1 不会再被选举为 leader
+
+另外，每个 Leader 在刚刚当选，也就是它的 term 的最开始，首先发送 no-op AppendEntries 请求
+- 这本质是一个优化手段，可以采用，也可以不采用，目的有两个
+- 1) 保证以前的 commit 不会被覆盖，这个和前面的讨论一致
+- 2) 保证以前没有 commit 的命令都 commit 和执行
+一旦 no-op 命令被 commit 了，那么说明该命令之前的 log entries 都已经被 committed 了，极大简化了流程
 
 
 ### 为什么 Leader Completeness 属性成立？
@@ -536,6 +566,11 @@ crash+restart 的流程
 - 服务器从 disk 上读取最近的 snapshot
 — 服务器从 disk 上读取持久化的 Logs，也就是 snapshot 之后的那些 Log entries
 - 服务器设置 lastApplied 为 last included index 以避免重新执行已经被执行了的 entries
+
+snapshot 可以使用系统自带的 copy-on-write 方式
+- 从当前服务进行 fork()，这样父子进程在内存中拥有完全相同的状态
+- 而且 fork() 并不真正直接在内存中 copy 一份，这会非常之慢
+- 大多数操作系统对内存页采用 copy-on-write 的方式，只有后续要对状态进行更改时，才会真正 copy 操作
 
 ##### InstallSnapshot 请求
 
@@ -714,7 +749,8 @@ linearizability 认为执行序列其实是：Wx3 Rx3 Wx4，仍然认为 Rx3 发
 
 对于一些应用，可能会有非常 heavy 的 read 只读请求，而如果获取 majority commit 的话，会比较花费时间
 - 方法一：一些实践中的应用，其调用者并不是很 care 是否得到相对 staled 的数据，而是更追求性能
-- 方法二：lease
+- 方法二：对所有服务器发送一个 empty AppendEntries 请求，确保 majority，说明还是 leader，再返回只读结果
+- 方法三：lease
   + 需要修改 Raft 协议，增加 lease 的概念，比如定义每个 lease 为 5 秒的时间
   + 每次 leader 的只读操作在 AppendEntries RPC 中获得了 majority，进入了 commit 状态，就发一个 lease
   + 在 Lease 的时间段里，后续的只读操作不再需要 majority commit 的要求
@@ -773,9 +809,19 @@ https://github.com/logcabin/logcabin
 ### Raft 的一些小结
 
 到此，我们已经学习完整个 Raft 的设计，包括：
+- 设计理念
+  + 客户端一定只通过 leader 和系统交互，如果客户端联系到非 leader，那么会返回其认为的 latest leader
+  + 服务器之间的请求和回复一定是由 leader 或 candidate 节点发起的
+    * AppendEntries & InstallSnapshot 由 leader 发起
+	* RequestVote 由 candidate
+  + 系统必须在选举出 leader 的情况下才能响应客户端的请求
+  + 不假设服务器之间时钟同步一致，故此顺序性依赖于单调递增的 term 和 index
+  + 不允许 "False Positive"，允许 "False Negative"
+    * 就是说不允许声明一个命令已经完成，但是其实没有完成，这样客户端就会继续后续命令，整个结果就错了
+	* 但是允许声明一个命令没有完成，但是其实已经完成了，这样客户端 re-try + 重复命令返回缓存值就可解决
 - 客户端发送请求后，Raft 集群处理请求的整个流程
 - Leader election 的算法，保证每个 term 最多只有一个 leader 产生
-- Raft 如何保证 logs 即使经历 failures 仍能保持一致化
+- Raft 如何保证 logs 即使经历 failures 仍能保持一致化，以及一致化的流程
 - Log Matching Property
 - Leader election 时的限制，使得 leader 一定会包含所有的 commits （Leader Completeness)
 - 各个服务器要持久化的数据，以免 reboot 后丢失
@@ -785,6 +831,7 @@ https://github.com/logcabin/logcabin
   + Fast Backup 的实现 
   + 如何提交之前 term 的 log entries
   + duplicate RPC detection 重发请求的检测
+    * Raft 保证每个命令对后台 state machine 的操作 at most once，故此对重复请求要返回缓存的值
   + More about 只读操作
   + Follower 或者 Candidates crash 会如何？
   + RPC 执行时间和 leader election timout 的选择
